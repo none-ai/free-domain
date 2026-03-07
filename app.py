@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
 import random
 import string
 import time
@@ -47,6 +48,52 @@ class Cart(db.Model):
     domain_name = db.Column(db.String(100), nullable=False)
     price = db.Column(db.Float, default=0.0)
 
+# Domain Auction/Bidding Models
+class Auction(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    domain_name = db.Column(db.String(100), unique=True, nullable=False)
+    starting_price = db.Column(db.Float, nullable=False)
+    current_price = db.Column(db.Float, nullable=False)
+    start_time = db.Column(db.DateTime, default=datetime.utcnow)
+    end_time = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(20), default='active')  # active, ended, cancelled
+    winner_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
+    winner = db.relationship('User', backref='won_auctions')
+
+class Bid(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    auction_id = db.Column(db.Integer, db.ForeignKey('auction.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    bid_time = db.Column(db.DateTime, default=datetime.utcnow)
+    is_winning = db.Column(db.Boolean, default=False)
+    auction = db.relationship('Auction', backref='bids')
+    bidder = db.relationship('User', backref='bids')
+
+# DNS Management Models
+class DNSRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey('domain.id'), nullable=False)
+    record_type = db.Column(db.String(10), nullable=False)  # A, CNAME, MX, TXT, NS
+    name = db.Column(db.String(100), nullable=False)
+    value = db.Column(db.String(255), nullable=False)
+    priority = db.Column(db.Integer, default=10)
+    ttl = db.Column(db.Integer, default=3600)
+    enabled = db.Column(db.Boolean, default=True)
+    domain = db.relationship('Domain', backref='dns_records')
+
+# Domain Parking Models
+class ParkingConfig(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey('domain.id'), nullable=False)
+    is_parked = db.Column(db.Boolean, default=False)
+    ad_provider = db.Column(db.String(50), default='custom')  # google, custom, none
+    custom_html = db.Column(db.Text, nullable=True)
+    views = db.Column(db.Integer, default=0)
+    clicks = db.Column(db.Integer, default=0)
+    revenue = db.Column(db.Float, default=0.0)
+    domain = db.relationship('Domain', backref='parking_config')
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
@@ -63,6 +110,24 @@ DOMAIN_PRICING = {
 # Initialize database
 with app.app_context():
     db.create_all()
+    # Create sample auctions for premium domains
+    if Auction.query.count() == 0:
+        sample_auctions = [
+            {'domain_name': 'premium.online', 'starting_price': 50.0, 'duration_hours': 72},
+            {'domain_name': 'awesome.site', 'starting_price': 75.0, 'duration_hours': 48},
+            {'domain_name': 'best.tech', 'starting_price': 100.0, 'duration_hours': 96},
+            {'domain_name': 'top.web', 'starting_price': 60.0, 'duration_hours': 72},
+            {'domain_name': 'pro.free', 'starting_price': 25.0, 'duration_hours': 24},
+        ]
+        for a in sample_auctions:
+            auction = Auction(
+                domain_name=a['domain_name'],
+                starting_price=a['starting_price'],
+                current_price=a['starting_price'],
+                end_time=datetime.utcnow() + timedelta(hours=a['duration_hours'])
+            )
+            db.session.add(auction)
+        db.session.commit()
 
 # Base template for professional UI
 BASE_TEMPLATE = """
@@ -372,6 +437,7 @@ BASE_TEMPLATE = """
                 <a href="/domains" class="nav-link {{ 'active' if request.path == '/domains' else '' }}">Domains</a>
                 <a href="/search" class="nav-link {{ 'active' if request.path == '/search' else '' }}">Search</a>
                 <a href="/pricing" class="nav-link {{ 'active' if request.path == '/pricing' else '' }}">Pricing</a>
+                <a href="/auctions" class="nav-link {{ 'active' if request.path == '/auctions' else '' }}">Auctions</a>
                 {% if current_user.is_authenticated %}
                     <a href="/dashboard" class="nav-link {{ 'active' if request.path == '/dashboard' else '' }}">Dashboard</a>
                     <a href="/cart" class="nav-link {{ 'active' if request.path == '/cart' else '' }}">Cart ({{ cart_count }})</a>
@@ -853,7 +919,7 @@ def dashboard():
                         <td>{{ domain.registration_date.strftime('%Y-%m-%d') if domain.registration_date else 'N/A' }}</td>
                         <td>{{ domain.expiry_date.strftime('%Y-%m-%d') if domain.expiry_date else 'N/A' }}</td>
                         <td>
-                            <button class="btn btn-outline" style="padding: 0.25rem 0.75rem;">Manage</button>
+                            <a href="/dashboard/dns/{{ domain.id }}" class="btn btn-outline" style="padding: 0.25rem 0.75rem;">Manage DNS</a>
                         </td>
                     </tr>
                     {% endfor %}
@@ -1007,6 +1073,604 @@ def cart_checkout():
     db.session.commit()
     flash('Domains registered successfully!', 'success')
     return redirect(url_for('dashboard'))
+
+# ==================== Domain Bidding System ====================
+@app.route('/auctions')
+def auctions():
+    active_auctions = Auction.query.filter_by(status='active').all()
+    now = datetime.utcnow()
+
+    auctions_data = []
+    for auction in active_auctions:
+        time_left = auction.end_time - now
+        hours_left = int(time_left.total_seconds() / 3600)
+        minutes_left = int((time_left.total_seconds() % 3600) / 60)
+
+        bid_count = Bid.query.filter_by(auction_id=auction.id).count()
+        highest_bid = Bid.query.filter_by(auction_id=auction.id, is_winning=True).first()
+
+        auctions_data.append({
+            'id': auction.id,
+            'domain_name': auction.domain_name,
+            'current_price': auction.current_price,
+            'starting_price': auction.starting_price,
+            'hours_left': hours_left,
+            'minutes_left': minutes_left,
+            'bid_count': bid_count,
+            'highest_bidder': highest_bid.bidder.username if highest_bid else None,
+            'is_ended': time_left.total_seconds() <= 0
+        })
+
+    # User's active bids
+    user_bids = []
+    if current_user.is_authenticated:
+        user_bids = Bid.query.filter_by(user_id=current_user.id).order_by(Bid.bid_time.desc()).limit(5).all()
+        user_bids_data = []
+        for bid in user_bids:
+            auction = Auction.query.get(bid.auction_id)
+            user_bids_data.append({
+                'domain': auction.domain_name if auction else 'Unknown',
+                'amount': bid.amount,
+                'time': bid.bid_time.strftime('%Y-%m-%d %H:%M'),
+                'winning': bid.is_winning
+            })
+        user_bids = user_bids_data
+
+    html = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
+    <div class="container">
+        <div class="page-header">
+            <h1 class="page-title">Domain Auctions</h1>
+            <p class="page-subtitle">Bid on premium domains up for auction</p>
+        </div>
+
+        {% if user_bids %}
+        <div class="card" style="margin-bottom: 2rem;">
+            <h3 style="margin-bottom: 1rem;">Your Recent Bids</h3>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Domain</th>
+                        <th>Your Bid</th>
+                        <th>Time</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for bid in user_bids %}
+                    <tr>
+                        <td><span class="domain-tag">{{ bid.domain }}</span></td>
+                        <td>${{ bid.amount }}</td>
+                        <td>{{ bid.time }}</td>
+                        <td>{% if bid.winning %}<span class="badge badge-available">Winning</span>{% else %}<span class="badge badge-taken">Outbid</span>{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        <div class="grid grid-3">
+            {% for auction in auctions %}
+            <div class="card">
+                <div class="card-header">
+                    <span class="domain-tag">{{ auction.domain_name }}</span>
+                    <span class="badge {{ 'badge-taken' if auction.is_ended else 'badge-available' }}">
+                        {{ 'Ended' if auction.is_ended else 'Active' }}
+                    </span>
+                </div>
+                <div style="margin: 1rem 0;">
+                    <div class="price">${{ auction.current_price }}</div>
+                    <small style="color: var(--text-muted);">Starting: ${{ auction.starting_price }}</small>
+                </div>
+                <div style="margin: 1rem 0; color: var(--text-muted);">
+                    {% if not auction.is_ended %}
+                    <div>{{ auction.hours_left }}h {{ auction.minutes_left }}m remaining</div>
+                    {% else %}
+                    <div>Auction ended</div>
+                    {% endif %}
+                    <div>{{ auction.bid_count }} bids</div>
+                    {% if auction.highest_bidder %}
+                    <div>Leading: {{ auction.highest_bidder }}</div>
+                    {% endif %}
+                </div>
+                {% if not auction.is_ended %}
+                <a href="/auction/{{ auction.id }}" class="btn btn-primary" style="width: 100%;">Place Bid</a>
+                {% else %}
+                <button class="btn btn-outline" style="width: 100%;" disabled>Ended</button>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+
+        {% if not auctions %}
+        <div class="empty-state">
+            <div class="empty-state-icon">🔨</div>
+            <h3>No active auctions</h3>
+            <p>Check back later for new domain auctions</p>
+        </div>
+        {% endif %}
+    </div>
+    ''')
+    return render_template_string(html, title='Domain Auctions', auctions=auctions_data, user_bids=user_bids if current_user.is_authenticated else [])
+
+@app.route('/auction/<int:auction_id>', methods=['GET', 'POST'])
+def auction_detail(auction_id):
+    auction = Auction.query.get_or_404(auction_id)
+    now = datetime.utcnow()
+    is_ended = auction.end_time < now
+
+    if request.method == 'POST' and not is_ended:
+        if not current_user.is_authenticated:
+            flash('Please login to place a bid', 'error')
+            return redirect(url_for('login'))
+
+        bid_amount = float(request.form.get('bid_amount', 0))
+        min_bid = auction.current_price + 1
+
+        if bid_amount < min_bid:
+            flash(f'Bid must be at least ${min_bid}', 'error')
+        else:
+            # Reset previous winning bid
+            Bid.query.filter_by(auction_id=auction.id, is_winning=True).update({'is_winning': False})
+
+            # Create new bid
+            new_bid = Bid(
+                auction_id=auction.id,
+                user_id=current_user.id,
+                amount=bid_amount,
+                is_winning=True
+            )
+            auction.current_price = bid_amount
+            db.session.add(new_bid)
+            db.session.commit()
+            flash(f'Bid of ${bid_amount} placed successfully!', 'success')
+
+    # Get bid history
+    bids = Bid.query.filter_by(auction_id=auction.id).order_by(Bid.bid_time.desc()).all()
+    bids_data = []
+    for bid in bids:
+        bids_data.append({
+            'bidder': bid.bidder.username[:3] + '***' if bid.bidder.username else 'Anonymous',
+            'amount': bid.amount,
+            'time': bid.bid_time.strftime('%Y-%m-%d %H:%M:%S'),
+            'winning': bid.is_winning
+        })
+
+    time_left = auction.end_time - now
+    hours_left = int(time_left.total_seconds() / 3600)
+    minutes_left = int((time_left.total_seconds() % 3600) / 60)
+
+    min_bid = auction.current_price + 1
+
+    html = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
+    <div class="container">
+        <div class="page-header">
+            <a href="/auctions" style="color: var(--text-muted); text-decoration: none;">← Back to Auctions</a>
+            <h1 class="page-title" style="margin-top: 1rem;">{{ auction.domain_name }}</h1>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
+            <div class="card">
+                <h3 style="margin-bottom: 1rem;">Current Bid</h3>
+                <div class="price" style="font-size: 3rem;">${{ auction.current_price }}</div>
+                <p style="color: var(--text-muted); margin: 1rem 0;">
+                    Starting price: ${{ auction.starting_price }}<br>
+                    {% if not is_ended %}
+                    Time remaining: {{ hours_left }}h {{ minutes_left }}m<br>
+                    {% else %}
+                    <span style="color: var(--danger);">Auction has ended</span><br>
+                    {% endif %}
+                    Total bids: {{ bids|length }}
+                </p>
+
+                {% if not is_ended %}
+                {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+                {% endfor %}
+                {% endif %}
+                {% endwith %}
+
+                {% if current_user.is_authenticated %}
+                <form method="POST">
+                    <div class="form-group">
+                        <label class="form-label">Your Bid (min ${{ min_bid }})</label>
+                        <input type="number" name="bid_amount" class="form-input" min="{{ min_bid }}" step="1" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%;">Place Bid</button>
+                </form>
+                {% else %}
+                <a href="/login" class="btn btn-primary" style="width: 100%;">Login to Bid</a>
+                {% endif %}
+                {% else %}
+                {% if auction.winner %}
+                <div class="alert alert-success">
+                    <strong>Winner:</strong> {{ auction.winner.username }}
+                </div>
+                {% else %}
+                <div class="alert alert-error">
+                    No winner - auction ended without a winning bid
+                </div>
+                {% endif %}
+                {% endif %}
+            </div>
+
+            <div class="card">
+                <h3 style="margin-bottom: 1rem;">Bid History</h3>
+                {% if bids %}
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th>Bidder</th>
+                            <th>Amount</th>
+                            <th>Time</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for bid in bids %}
+                        <tr>
+                            <td>{{ bid.bidder }}{% if bid.winning %} <span class="badge badge-available">Winning</span>{% endif %}</td>
+                            <td>${{ bid.amount }}</td>
+                            <td>{{ bid.time }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <p style="color: var(--text-muted);">No bids yet. Be the first to bid!</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    ''')
+    return render_template_string(html, title=f'Auction: {auction.domain_name}', auction=auction, bids=bids_data, is_ended=is_ended, min_bid=min_bid, hours_left=hours_left, minutes_left=minutes_left)
+
+# ==================== Domain Parking System ====================
+@app.route('/parking/<domain_name>')
+def parking_page(domain_name):
+    """Public parking page for domains with ads"""
+    domain = Domain.query.filter_by(name=domain_name).first()
+    if not domain:
+        return "Domain not found", 404
+
+    # Get or create parking config
+    parking = ParkingConfig.query.filter_by(domain_id=domain.id).first()
+    if not parking:
+        parking = ParkingConfig(domain_id=domain.id, is_parked=True)
+        db.session.add(parking)
+        db.session.commit()
+
+    # Increment views
+    parking.views += 1
+    db.session.commit()
+
+    # Generate ad content based on provider
+    ad_content = ""
+    if parking.ad_provider == 'custom':
+        ad_content = '''
+        <div class="ad-slot">
+            <div class="ad-label">Sponsored</div>
+            <div class="ad-content">
+                <h3>Premium Domain For Sale</h3>
+                <p>{{ domain_name }} is a premium domain available for purchase.</p>
+                <a href="#" class="btn btn-primary">Contact Owner</a>
+            </div>
+        </div>
+        '''
+    else:
+        ad_content = '''
+        <div class="ad-slot">
+            <div class="ad-label">Advertisement</div>
+            <div class="ad-content">
+                <h3>Your Ad Here</h3>
+                <p>Contact us to advertise on this premium domain.</p>
+            </div>
+        </div>
+        '''
+
+    html = f'''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>{domain_name} - Domain Parking</title>
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: #fff; min-height: 100vh; }}
+            .container {{ max-width: 1000px; margin: 0 auto; padding: 2rem; text-align: center; }}
+            .domain-title {{ font-size: 3rem; font-weight: 700; margin: 2rem 0; background: linear-gradient(135deg, #6366f1, #22d3ee); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+            .parking-header {{ padding: 2rem; }}
+            .domain-name {{ font-size: 4rem; font-weight: 700; margin-bottom: 1rem; }}
+            .status-badge {{ display: inline-block; background: rgba(16, 185, 129, 0.2); color: #10b981; padding: 0.5rem 1rem; border-radius: 9999px; font-weight: 600; }}
+            .ad-container {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin: 3rem 0; }}
+            .ad-slot {{ background: rgba(255,255,255,0.1); border-radius: 1rem; padding: 2rem; backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1); }}
+            .ad-label {{ font-size: 0.75rem; text-transform: uppercase; color: rgba(255,255,255,0.5); margin-bottom: 1rem; }}
+            .ad-content h3 {{ font-size: 1.25rem; margin-bottom: 0.5rem; }}
+            .ad-content p {{ color: rgba(255,255,255,0.7); margin-bottom: 1rem; }}
+            .btn {{ display: inline-block; padding: 0.75rem 1.5rem; background: #6366f1; color: white; text-decoration: none; border-radius: 0.5rem; font-weight: 500; transition: all 0.2s; }}
+            .btn:hover {{ background: #818cf8; transform: translateY(-2px); }}
+            .stats {{ display: flex; justify-content: center; gap: 3rem; margin-top: 3rem; padding: 2rem; background: rgba(0,0,0,0.2); border-radius: 1rem; }}
+            .stat {{ text-align: center; }}
+            .stat-value {{ font-size: 2rem; font-weight: 700; color: #6366f1; }}
+            .stat-label {{ color: rgba(255,255,255,0.5); font-size: 0.875rem; }}
+            .footer {{ margin-top: 3rem; color: rgba(255,255,255,0.3); font-size: 0.875rem; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="parking-header">
+                <div class="domain-name">{domain_name}</div>
+                <span class="status-badge">Domain For Sale</span>
+            </div>
+
+            <div class="ad-container">
+                {ad_content}
+                <div class="ad-slot">
+                    <div class="ad-label">Featured</div>
+                    <div class="ad-content">
+                        <h3>Build Your Brand</h3>
+                        <p>This premium domain is perfect for your next project.</p>
+                        <a href="#" class="btn">Learn More</a>
+                    </div>
+                </div>
+                <div class="ad-slot">
+                    <div class="ad-label">Offer</div>
+                    <div class="ad-content">
+                        <h3>Make an Offer</h3>
+                        <p>Interested in this domain? Send us an offer.</p>
+                        <a href="#" class="btn">Contact Now</a>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value">{parking.views}</div>
+                    <div class="stat-label">Page Views</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">{parking.clicks}</div>
+                    <div class="stat-label">Clicks</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value">${parking.revenue:.2f}</div>
+                    <div class="stat-label">Revenue</div>
+                </div>
+            </div>
+
+            <div class="footer">
+                <p>Powered by FreeDomain | <a href="/" style="color: #6366f1;">Get your own domain</a></p>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    return html
+
+@app.route('/dashboard/park/<int:domain_id>', methods=['POST'])
+@login_required
+def park_domain(domain_id):
+    """Enable domain parking"""
+    domain = Domain.query.get_or_404(domain_id)
+    if domain.user_id != current_user.id:
+        flash('You do not own this domain', 'error')
+        return redirect(url_for('dashboard'))
+
+    parking = ParkingConfig.query.filter_by(domain_id=domain.id).first()
+    if not parking:
+        parking = ParkingConfig(domain_id=domain.id)
+        db.session.add(parking)
+
+    parking.is_parked = not parking.is_parked
+    db.session.commit()
+
+    status = "parked" if parking.is_parked else "unparked"
+    flash(f'Domain {status} successfully!', 'success')
+    return redirect(url_for('dashboard'))
+
+# ==================== DNS Management Panel ====================
+@app.route('/dashboard/dns/<int:domain_id>')
+@login_required
+def dns_management(domain_id):
+    """DNS records management panel"""
+    domain = Domain.query.get_or_404(domain_id)
+    if domain.user_id != current_user.id:
+        flash('You do not own this domain', 'error')
+        return redirect(url_for('dashboard'))
+
+    dns_records = DNSRecord.query.filter_by(domain_id=domain.id).all()
+
+    # Get parking status
+    parking = ParkingConfig.query.filter_by(domain_id=domain.id).first()
+
+    html = BASE_TEMPLATE.replace('{% block content %}{% endblock %}', '''
+    <div class="container">
+        <div class="page-header">
+            <a href="/dashboard" style="color: var(--text-muted); text-decoration: none;">← Back to Dashboard</a>
+            <h1 class="page-title" style="margin-top: 1rem;">DNS Management: {{ domain.name }}</h1>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 300px; gap: 2rem;">
+            <div>
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">DNS Records</h3>
+                        <button class="btn btn-primary" onclick="document.getElementById('addRecord').style.display='block'">+ Add Record</button>
+                    </div>
+
+                    <div id="addRecord" style="display: none; margin-bottom: 1.5rem; padding: 1rem; background: var(--card-bg); border: 1px solid var(--border); border-radius: 0.5rem;">
+                        <form method="POST" action="/dashboard/dns/{{ domain.id }}/add">
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                                <div class="form-group">
+                                    <label class="form-label">Record Type</label>
+                                    <select name="record_type" class="form-input" required>
+                                        <option value="A">A</option>
+                                        <option value="CNAME">CNAME</option>
+                                        <option value="MX">MX</option>
+                                        <option value="TXT">TXT</option>
+                                        <option value="NS">NS</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Name</label>
+                                    <input type="text" name="name" class="form-input" placeholder="@ or subdomain" required>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Value</label>
+                                <input type="text" name="value" class="form-input" placeholder="IP address or hostname" required>
+                            </div>
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                                <div class="form-group">
+                                    <label class="form-label">Priority (MX)</label>
+                                    <input type="number" name="priority" class="form-input" value="10">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">TTL</label>
+                                    <input type="number" name="ttl" class="form-input" value="3600">
+                                </div>
+                            </div>
+                            <div style="display: flex; gap: 1rem;">
+                                <button type="submit" class="btn btn-primary">Add Record</button>
+                                <button type="button" class="btn btn-outline" onclick="document.getElementById('addRecord').style.display='none'">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    {% if dns_records %}
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Type</th>
+                                <th>Name</th>
+                                <th>Value</th>
+                                <th>Priority</th>
+                                <th>TTL</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for record in dns_records %}
+                            <tr>
+                                <td><span class="badge badge-premium">{{ record.record_type }}</span></td>
+                                <td>{{ record.name }}</td>
+                                <td style="font-family: monospace;">{{ record.value }}</td>
+                                <td>{{ record.priority }}</td>
+                                <td>{{ record.ttl }}</td>
+                                <td>{% if record.enabled %}<span class="badge badge-available">Active</span>{% else %}<span class="badge badge-taken">Disabled</span>{% endif %}</td>
+                                <td>
+                                    <form method="POST" action="/dashboard/dns/{{ domain.id }}/toggle/{{ record.id }}" style="display: inline;">
+                                        <button type="submit" class="btn btn-outline" style="padding: 0.25rem 0.5rem;">
+                                            {{ 'Disable' if record.enabled else 'Enable' }}
+                                        </button>
+                                    </form>
+                                    <form method="POST" action="/dashboard/dns/{{ domain.id }}/delete/{{ record.id }}" style="display: inline;">
+                                        <button type="submit" class="btn btn-danger" style="padding: 0.25rem 0.5rem;" onclick="return confirm('Delete this record?')">Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                    {% else %}
+                    <div class="empty-state">
+                        <p>No DNS records yet. Add your first record to get started.</p>
+                    </div>
+                    {% endif %}
+                </div>
+
+                <div class="card" style="margin-top: 1.5rem;">
+                    <h3 class="card-title" style="margin-bottom: 1rem;">Nameservers</h3>
+                    <div style="font-family: monospace; background: rgba(0,0,0,0.3); padding: 1rem; border-radius: 0.5rem;">
+                        <div>ns1.freedomain.com</div>
+                        <div>ns2.freedomain.com</div>
+                        <div>ns3.freedomain.com</div>
+                        <div>ns4.freedomain.com</div>
+                    </div>
+                    <p style="margin-top: 1rem; color: var(--text-muted);">Use these nameservers to point your domain to our DNS servers.</p>
+                </div>
+            </div>
+
+            <div>
+                <div class="card">
+                    <h3 class="card-title" style="margin-bottom: 1rem;">Quick Actions</h3>
+                    <a href="/parking/{{ domain.name }}" target="_blank" class="btn btn-outline" style="width: 100%; margin-bottom: 0.5rem;">View Parking Page</a>
+                    <form method="POST" action="/dashboard/park/{{ domain.id }}">
+                        <button type="submit" class="btn {{ 'btn-danger' if parking and parking.is_parked else 'btn-primary' }}" style="width: 100%;">
+                            {{ 'Unpark Domain' if parking and parking.is_parked else 'Park Domain' }}
+                        </button>
+                    </form>
+                </div>
+
+                <div class="card" style="margin-top: 1rem;">
+                    <h3 class="card-title" style="margin-bottom: 1rem;">Domain Info</h3>
+                    <div style="color: var(--text-muted);">
+                        <p><strong>Domain:</strong> {{ domain.name }}</p>
+                        <p><strong>Registered:</strong> {{ domain.registration_date.strftime('%Y-%m-%d') if domain.registration_date else 'N/A' }}</p>
+                        <p><strong>Expires:</strong> {{ domain.expiry_date.strftime('%Y-%m-%d') if domain.expiry_date else 'N/A' }}</p>
+                        <p><strong>Status:</strong> {{ domain.status }}</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    ''')
+    return render_template_string(html, title=f'DNS: {domain.name}', domain=domain, dns_records=dns_records, parking=parking)
+
+@app.route('/dashboard/dns/<int:domain_id>/add', methods=['POST'])
+@login_required
+def dns_add_record(domain_id):
+    """Add DNS record"""
+    domain = Domain.query.get_or_404(domain_id)
+    if domain.user_id != current_user.id:
+        flash('You do not own this domain', 'error')
+        return redirect(url_for('dashboard'))
+
+    record = DNSRecord(
+        domain_id=domain.id,
+        record_type=request.form.get('record_type'),
+        name=request.form.get('name'),
+        value=request.form.get('value'),
+        priority=int(request.form.get('priority', 10)),
+        ttl=int(request.form.get('ttl', 3600))
+    )
+    db.session.add(record)
+    db.session.commit()
+    flash('DNS record added successfully!', 'success')
+    return redirect(url_for('dns_management', domain_id=domain.id))
+
+@app.route('/dashboard/dns/<int:domain_id>/toggle/<int:record_id>', methods=['POST'])
+@login_required
+def dns_toggle_record(domain_id, record_id):
+    """Toggle DNS record enabled/disabled"""
+    domain = Domain.query.get_or_404(domain_id)
+    if domain.user_id != current_user.id:
+        flash('You do not own this domain', 'error')
+        return redirect(url_for('dashboard'))
+
+    record = DNSRecord.query.get_or_404(record_id)
+    record.enabled = not record.enabled
+    db.session.commit()
+    flash(f'DNS record { "enabled" if record.enabled else "disabled" }!', 'success')
+    return redirect(url_for('dns_management', domain_id=domain.id))
+
+@app.route('/dashboard/dns/<int:domain_id>/delete/<int:record_id>', methods=['POST'])
+@login_required
+def dns_delete_record(domain_id, record_id):
+    """Delete DNS record"""
+    domain = Domain.query.get_or_404(domain_id)
+    if domain.user_id != current_user.id:
+        flash('You do not own this domain', 'error')
+        return redirect(url_for('dashboard'))
+
+    record = DNSRecord.query.get_or_404(record_id)
+    db.session.delete(record)
+    db.session.commit()
+    flash('DNS record deleted!', 'success')
+    return redirect(url_for('dns_management', domain_id=domain.id))
 
 @app.route('/api/domains')
 def api_domains():
