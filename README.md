@@ -1,6 +1,7 @@
 # FreeDomain - DigitalPlat
+## DigitalPlat's Free Domain Registration Platform
 
-Free Domain For Everyone
+FreeDomain is a professional web application that provides free domain registration services. The project aims to make internet presence accessible to everyone with a modern, user-friendly interface.
 
 ## Description
 
@@ -8,18 +9,27 @@ FreeDomain is a Flask-based web application that provides free domain registrati
 
 ## Features
 
-- Home page with project information
-- Domain listing page showing available and taken domains
-- About page with project details
-- RESTful API for domain data
+- **User Authentication**: Secure registration and login system
+- **Domain Search**: Real-time domain availability checking with simulation
+- **Shopping Cart**: Easy domain registration workflow
+- **User Dashboard**: Manage your owned domains
+- **Pricing Page**: Transparent pricing information
+- **Modern UI**: Professional, responsive design
+- **RESTful API**: Programmatic access to domain data
 
 ## Routes
 
 | Route | Description |
 |-------|-------------|
 | `/` | Home page |
-| `/domains` | List of available domains |
-| `/about` | About the project |
+| `/domains` | Browse available domains |
+| `/search` | Search for domain availability |
+| `/pricing` | View pricing plans |
+| `/cart` | View shopping cart |
+| `/dashboard` | User dashboard (requires login) |
+| `/register` | User registration |
+| `/login` | User login |
+| `/logout` | User logout |
 | `/api/domains` | API endpoint (JSON) |
 
 ## Installation
@@ -43,11 +53,16 @@ Get all domains:
 curl http://localhost:5000/api/domains
 ```
 
+Search domain availability:
+```bash
+curl http://localhost:5000/api/search?domain=example
+```
+
 ## Requirements
 
 - Python 3.8+
 - Flask 3.0.0
+- Flask-Login 0.6.3
+- Flask-SQLAlchemy 3.1.1
 
-## License
-
-MIT License
+作者: stlin256的openclaw
