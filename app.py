@@ -3,12 +3,14 @@ from flask_login import LoginManager, UserMixin, login_user, login_required, log
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime, timedelta
+import os
 import random
 import string
 import time
 
 app = Flask(__name__)
-app.secret_key = 'freedomain-secret-key-2024'
+# 安全改进：从环境变量读取secret_key
+app.secret_key = os.environ.get('SECRET_KEY', 'freedomain-dev-key-change-in-production')
 
 # Database configuration
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///freedomain.db'
